@@ -1,0 +1,460 @@
+---
+title: "Bayesian Analysis with EDA"
+author: "GCSM1"
+date: "2024-07-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Load libraries
+knitr::opts_chunk$set(echo = TRUE)
+library(rstan)
+library(bayesplot)
+library(tidyverse)
+library(sf)
+library(tmap)
+library(spdep)
+```
+
+```{r}
+# Load data
+
+housing_data <- read_csv('C:/Users/USUARIO/Documents/UCL/Summer/bayesian/housing_in_london_yearly_variables.csv')
+greenry_df <- read_csv("C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/neighborhood data/greenery boroughs.csv")
+crime_df <- read_csv("C:/Users/USUARIO/Documents/UCL//Dissertation/v3 longitudinal diaspora study/Data/neighborhood data/historic crime 2010-2021.csv")
+religion_df <- read_csv("C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/neighborhood data/religion msoa 2021.csv")
+msoa <- st_read("C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/MSOA_2011_London_gen_MHW.shp")
+rents <- read_csv("C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/private rents.csv")
+social_housing <- read_csv("C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/affordable budget.csv")
+lsoa <- st_read("C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/LSOA_2011_London_gen_MHW.shp")
+borough <- st_read("C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/London_Borough_Excluding_MHW.shp")
+```
+
+```{r}
+# Preprocess housing data
+housing_data_cleaned <- housing_data %>%
+  mutate(year = as.integer(substr(date, 1, 4))) %>%
+  select(area, year, life_satisfaction, number_of_jobs, population_size, no_of_houses, median_salary) %>%
+  na.omit()
+
+# Verify numeric conversion for specific columns
+housing_data_cleaned <- housing_data_cleaned %>%
+  mutate(across(c(year, life_satisfaction, number_of_jobs, population_size, no_of_houses, median_salary), as.numeric))
+```
+
+```{r}
+# Preprocess greenery data
+greenery_data_cleaned <- greenry_df %>%
+  rename(area = lb_code) %>%
+  select(area, percent_green) %>%
+  na.omit() %>%
+  mutate(percent_green = as.numeric(percent_green))
+
+# Create a data frame with years 2011-2018
+years <- data.frame(year = 2011:2018)
+
+expanded_grenery <- merge(greenery_data_cleaned, years)
+```
+
+```{r}
+# Preprocess crime data
+
+# Rename 'Borough' column to 'Code'
+crime_df <- crime_df %>% rename(code = Borough)
+
+# Aggregate crime values by 'Code'
+aggregated_crime <- crime_df %>%
+  group_by(code) %>%
+  summarise(across(starts_with("20"), sum, na.rm = TRUE))
+
+# Sum values by year
+aggregated_crime <- aggregated_crime %>%
+  gather(key = "YearMonth", value = "Count", -code) %>%
+  mutate(Year = substr(YearMonth, 1, 4)) %>%
+  group_by(code, Year) %>%
+  summarise(Yearly_Total = sum(Count)) %>%
+  spread(key = Year, value = Yearly_Total)
+
+# Filter to keep only years 2011-2018
+years_to_keep <- as.character(2011:2018)
+final_crime <- aggregated_crime %>%
+  select(code, all_of(years_to_keep))
+
+# Transform to long format
+long_crime <- final_crime %>%
+  pivot_longer(cols = `2011`:`2018`, names_to = "year", values_to = "crime_counts")
+```
+
+```{r}
+# Preprocess religion data
+
+# Rename the column 'Middle layer Super Output Areas Code' to 'msoa11cd'
+religion_df <- religion_df %>%
+  rename(msoa11cd = `Middle layer Super Output Areas Code`)
+
+# Filter out 'Does not apply' and find the majority religion for each MSOA
+majority_religion <- religion_df %>%
+  filter(`Religion (detailed) (58 categories)` != "Does not apply") %>%
+  group_by(msoa11cd) %>%
+  slice(which.max(Observation)) %>%
+  select(msoa11cd, `Religion (detailed) (58 categories)`) %>%
+  rename(religion = `Religion (detailed) (58 categories)`)
+
+# join to shp
+msoa_religion <- msoa %>%
+  left_join(majority_religion, by = c("MSOA11CD" = "msoa11cd")) %>%
+  select(MSOA11CD, LAD11NM, religion)
+filtered_data <- msoa_religion %>%
+  select(-MSOA11CD) %>%
+  st_drop_geometry()
+joined_data <- filtered_data %>%
+  left_join(borough, by = c("LAD11NM" = "NAME"))
+
+# Aggregate to find the majority religion for each GSS_CODE
+majority_religion <- joined_data %>%
+  group_by(GSS_CODE) %>%
+  summarise(religion = names(sort(table(religion), decreasing = TRUE)[1]))
+
+# Rename GSS_CODE to code
+majority_religion <- majority_religion %>%
+  rename(code = GSS_CODE)
+
+# Create a data frame with years 2011-2018
+years <- data.frame(year = 2011:2018)
+
+# Use merge() to perform a Cartesian join
+expanded_religion <- merge(majority_religion, years)
+
+# Convert 'religion' to a factor
+expanded_religion$religion <- as.factor(expanded_religion$religion)
+# Encode the 'religion' factor as numeric
+expanded_religion$religion_numeric <- as.numeric(expanded_religion$religion)
+
+# clean columns
+expanded_religion <- subset(expanded_religion, select = -religion)
+```
+
+```{r}
+# Merge datasets with each other and geometry
+
+# Convert the area column to lowercase in both datasets
+housing_data_cleaned$area <- tolower(housing_data_cleaned$area)
+expanded_grenery$area <- tolower(expanded_grenery$area)
+housing_data_cleaned$year <- as.character(housing_data_cleaned$year)
+expanded_grenery$year <- as.character(expanded_grenery$year)
+
+# Perform the full join 
+housing_greenery <- housing_data_cleaned %>%
+  full_join(expanded_grenery, by = c("area", "year"))
+
+# Convert the year column to character in both datasets
+long_crime$year <- as.character(long_crime$year)
+expanded_religion$year <- as.character(expanded_religion$year)
+
+# Perform the full join
+crime_religion <- long_crime %>%
+  full_join(expanded_religion, by = c("code" = "code", "year" = "year"))
+
+borough$NAME <- tolower(borough$NAME)
+borough_data <- housing_greenery %>%
+  left_join(borough, by = c("area" = "NAME"))
+final_data <- crime_religion %>%
+  left_join(borough_data, by = c("code" = "GSS_CODE", "year"))
+
+final <- final_data %>%
+  select(-HECTARES, -NONLD_AREA, -ONS_INNER, -SUB_2009, -SUB_2006)
+```
+
+```{r}
+# Correlation matrix
+
+str(final)
+# Convert religion to a factor and then to numeric labels
+final$religion <- as.numeric(factor(final$religion))
+str(final)
+
+# Remove non-numeric columns if any
+final_numeric <- final[sapply(final, is.numeric)]
+
+# Calculate the correlation matrix
+correlation_matrix <- cor(final_numeric, use = "complete.obs")
+
+# Print the correlation matrix
+print(correlation_matrix)
+
+library(corrplot)
+# Using corrplot to visualize the correlation matrix
+corrplot(correlation_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, 
+         col = colorRampPalette(c("blue", "white", "red"))(200))
+```
+
+```{r}
+# Convert 'code' and 'area' into factor levels for Stan compatibility
+final$borough_id <- as.numeric(factor(final$code))
+final$year_id <- as.numeric(factor(final$year))
+```
+
+```{r}
+# Validate geography
+
+final_sf <- st_as_sf(final, crs = 27700)
+
+# Check for invalid geometries
+invalid_geom <- st_is_valid(final_sf, reason = TRUE)
+print(invalid_geom)
+```
+
+```{r}
+library(dplyr)
+library(splines)
+
+# Create spline terms for year
+final_sf <- cbind(final_sf, as.data.frame(bs(final_sf$year, knots = c(2012, 2013, 2014, 2015, 2016, 2017), degree = 3)))
+
+# Define new predictors including spline terms
+predictors <- c("X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8", "X9", "religion", "life_satisfaction", "number_of_jobs", "population_size", "no_of_houses", "median_salary", "percent_green")
+
+# Handle missing values in crime_counts
+final_sf$crime_counts[is.na(final_sf$crime_counts)] <- mean(final_sf$crime_counts, na.rm = TRUE)
+
+# Total number of observations
+N <- nrow(final_sf)  # Should be 264
+
+# Number of predictors
+K <- length(predictors)
+
+# Predictor matrix
+X <- as.matrix(st_drop_geometry(final_sf) %>% select(all_of(predictors)))
+X <- X[, !(colnames(X) %in% "code")]
+# Ensure the columns are numeric
+X <- apply(X, 2, as.numeric)
+
+# Response vector
+y <- final_sf$crime_counts
+
+# Number of unique areas and years
+num_areas <- length(unique(final_sf$area))  # Should be 33
+num_years <- length(unique(final_sf$year))  # Should be 8
+
+# Area and year indices
+area <- as.integer(factor(final_sf$area))  # Coded from 1 to 33
+year <- as.integer(factor(final_sf$year))  # Coded from 1 to 8
+
+# Create spatial neighbors and weight matrix
+unique_sf <- final_sf %>%
+  group_by(area) %>%
+  slice(1) %>% 
+  ungroup()
+
+coords <- st_centroid(st_geometry(unique_sf))
+nb <- knn2nb(knearneigh(coords, k = 4)) # Adjust k as needed
+W_unique <- nb2mat(nb, style = "W")
+
+# Create full W matrix for all observations
+num_areas <- 33
+num_years <- 8
+n_obs <- num_areas * num_years
+
+W_full <- matrix(0, nrow = n_obs, ncol = n_obs)
+
+for (i in 1:num_years) {
+  start_idx <- (i - 1) * num_areas + 1
+  end_idx <- i * num_areas
+  W_full[start_idx:end_idx, start_idx:end_idx] <- W_unique
+}
+
+# Verify dimensions and properties
+dim(W_full) 
+
+# Ensure W_full is symmetric
+W_full <- (W_full + t(W_full)) / 2
+
+if (!isSymmetric(W_full)) {
+  stop("W_full is not symmetric.")
+}
+
+# Add small value to diagonal to make it positive definite
+epsilon <- 0.00001
+W_full <- W_full + epsilon * diag(nrow(W_full))
+
+# Verify positive definiteness
+eigen_values <- eigen(W_full)$values
+if (any(eigen_values <= 0)) {
+  stop("W_full is not positive definite even after adjustment.")
+}
+
+# Function to ensure positive definiteness by increasing epsilon
+make_positive_definite <- function(W, epsilon_start = 0.00001, max_attempts = 10) {
+  for (i in 1:max_attempts) {
+    W_adj <- W + epsilon_start * diag(nrow(W))
+    if (all(eigen(W_adj)$values > 0)) {
+      return(W_adj)
+    }
+    epsilon_start <- epsilon_start * 10
+  }
+  stop("Failed to make W_full positive definite after multiple attempts.")
+}
+
+# Apply the function
+W_full <- make_positive_definite(W_full)
+
+area <- as.integer(factor(final_sf$area))
+year <- as.integer(factor(final_sf$year))
+
+# Create the stan_data list
+stan_data <- list(
+  N = nrow(final_sf),
+  K = length(predictors),
+  X = X,
+  y = y,
+  num_areas = length(unique(final_sf$area)),
+  area = area,
+  num_years = length(unique(final_sf$year)),
+  year = year,
+  W = W_full
+)
+
+# Check the structure of stan_data
+str(stan_data)
+
+# Run the Stan model
+fit <- stan(file = 'model.stan', data = stan_data, iter = 2000, chains = 4)
+print(fit)
+
+```
+```{r}
+traceplot(fit)
+```
+```{r}
+summary(fit)
+```
+
+
+```{r}
+# Prepare data
+final_sf$area <- as.factor(final_sf$code)
+
+# Extract predicted values from the Stan model fit using rstan::extract
+fit_extract <- rstan::extract(fit)
+y_pred_mean <- apply(fit_extract$y_pred, 2, mean)
+
+# Add predicted values to final_sf
+final_sf$crime_pred <- y_pred_mean
+
+# Plot current crime data
+current_crime_map <- ggplot(data = final_sf) +
+  geom_sf(aes(fill = crime_counts)) +
+  scale_fill_viridis_c(option = "viridis", name = "Crime Counts") +
+  theme_minimal() +
+  ggtitle("Current Crime Data")
+
+# Plot predicted crime data
+predicted_crime_map <- ggplot(data = final_sf) +
+  geom_sf(aes(fill = crime_pred)) +
+  scale_fill_viridis_c(option = "viridis", name = "Predicted Crime") +
+  theme_minimal() +
+  ggtitle("Predicted Crime Data")
+
+# Print maps
+print(current_crime_map)
+print(predicted_crime_map)
+```
+
+```{r}
+# Convert year to numeric if it's not already
+final_sf$year <- as.numeric(final_sf$year)
+
+# Convert final_sf to a regular dataframe
+final_df <- st_drop_geometry(final_sf)
+
+# Extract the predicted crime counts
+y_rep <- rstan::extract(fit)$y_pred
+
+# Check the dimensions of y_rep
+dim(y_rep)
+# Check the first few rows of y_rep to see the predictions for individual observations
+head(y_rep)
+
+# Calculate the mean predicted crime counts for each year
+predicted_crime_means <- apply(y_rep, 2, mean)
+
+# Add the predicted crime means to the final_df dataframe
+final_df$predicted_crime <- predicted_crime_means
+
+print(head(final_df))
+
+# Aggregate the actual and predicted crime counts by year
+actual_crime_by_year <- final_df %>%
+  group_by(year) %>%
+  summarise(actual_crime = sum(crime_counts))
+
+predicted_crime_by_year <- final_df %>%
+  group_by(year) %>%
+  summarise(predicted_crime = sum(predicted_crime))
+
+# Combine actual and predicted crime data
+crime_data <- actual_crime_by_year %>%
+  inner_join(predicted_crime_by_year, by = "year")
+```
+```{r}
+# Plot the actual crime counts over the years
+ggplot(crime_data, aes(x = year)) +
+  geom_line(aes(y = actual_crime, color = "Actual Crime")) +
+  geom_line(aes(y = predicted_crime, color = "Predicted Crime")) +
+  labs(title = "Actual vs. Predicted Crime Counts Over the Years",
+       x = "Year",
+       y = "Crime Counts") +
+  scale_color_manual(name = "Legend", values = c("Actual Crime" = "blue", "Predicted Crime" = "red")) +
+  theme_minimal()
+```
+```{r}
+# Calculate residuals
+final_sf$residuals <- final_sf$crime_counts - final_sf$crime_pred
+
+# Aggregate residuals by year
+residuals_by_year <- final_sf %>%
+  group_by(year) %>%
+  summarise(mean_residuals = mean(residuals))
+
+# Plot residuals over the years
+ggplot(residuals_by_year, aes(x = year, y = mean_residuals)) +
+  geom_line(color = "purple") +
+  labs(title = "Mean Residuals Over the Years",
+       x = "Year",
+       y = "Mean Residuals") +
+  theme_minimal()
+```
+
+```{r}
+# Calculate RMSE
+rmse <- sqrt(mean(final_sf$residuals^2))
+print(paste("RMSE:", rmse))
+
+# Calculate MAE
+mae <- mean(abs(final_sf$residuals))
+print(paste("MAE:", mae))
+
+```
+```{r}
+# Extract posterior samples for predicted crime counts
+posterior_samples <- rstan::extract(fit)
+
+# Define your threshold for exceedance probability
+threshold <- 30000  # Example threshold
+
+# Calculate exceedance probabilities
+exceedance_probs <- apply(posterior_samples$y_pred, 2, function(x) mean(x > threshold))
+
+# Ensure final_sf is your spatial data frame with geometry and other data
+final_sf$exceedance_prob <- exceedance_probs
+
+# Plot the exceedance probability map
+ggplot(data = final_sf) +
+  geom_sf(aes(fill = exceedance_prob)) +
+  scale_fill_gradient(low = "blue", high = "red", name = "Exceedance Probability") +
+  labs(title = "Exceedance Probability Map") +
+  theme_minimal()
+```
+
+
